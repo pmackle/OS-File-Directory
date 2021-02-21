@@ -1,6 +1,27 @@
 # Target library
 lib := libfs.a
+objs := disk.o fs.o
+
+CC := gcc
+CFLAGS := -Wall -Wextra -Werror -MMD
+
+ifneq ($(V),1)
+Q = @
+endif
 
 all: $(lib)
 
-## TODO: Phase 1
+deps := $(patsubst %.o, %.d, $(objs))
+-include $(deps)
+
+$(lib): $(objs)
+	@echo "CC	$@"
+	ar rcs $@ $^
+
+%.o: %.c
+	@echo "CC	$@"
+	$(Q)$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	@echo "CLEAN"
+	$(Q)rm -f $(lib) $(objs) $(deps) *.d

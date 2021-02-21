@@ -61,4 +61,3 @@ int block_write(size_t block, const void *buf);
 int block_read(size_t block, void *buf);
 
 #endif /* _DISK_H */
-

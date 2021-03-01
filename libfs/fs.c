@@ -7,6 +7,8 @@
 #include "disk.h"
 #include "fs.h"
 
+#define FAT_EOC 0xFFFF
+
 #define SIG_LEN 8
 #define SUP_BLK_PAD 4079
 
@@ -30,10 +32,17 @@ struct __attribute__((__packed__)) fat_block {
 #define ROOT_DIR_PAD 10
 
 struct __attribute__((__packed__)) root_dir_entry {
-	uint8_t filename[FS_FILENAME_LEN];
+	// Explicitly use char array for comparison to final character pointers.
+	char filename[FS_FILENAME_LEN];
 	uint32_t size_file;
 	uint16_t idx_first_data_blk;
 	uint8_t padding[ROOT_DIR_PAD];
+};
+
+struct file_descriptor {
+	int idx_file_root_dir;
+	int file_descriptor;
+	size_t file_offset;
 };
 
 // Virgin block representations, for cleaning purposes upon an unmount call.
@@ -41,16 +50,22 @@ static const struct superblock clean_superblock;
 #define CLEAN_FAT NULL
 static const struct root_dir_entry clean_root_dir_entry;
 
-// For tracking purposes.
-static int fs_mounted = 0;
-static int num_open_fds = 0;
-
 static struct superblock superblock;
 // To be allocated once we know how many blocks are necessary.
 static struct fat_block* fat;
 static struct root_dir_entry root_directory[FS_FILE_MAX_COUNT];
 
-#define SUP_BLK_IDX 0
+static int num_open_fds = 0;
+static const struct file_descriptor empty_FD = {
+	.idx_file_root_dir = -1,
+	.file_descriptor = 0,
+	.file_offset = 0
+};
+static struct file_descriptor FD[FS_OPEN_MAX_COUNT];
+
+// For tracking purposes.
+static int fs_mounted = 0;
+static int num_files_root_dir = 0;
 
 int fs_mount(const char *diskname)
 {
@@ -58,7 +73,7 @@ int fs_mount(const char *diskname)
 		return -1;
 	}
 
-	block_read(SUP_BLK_IDX, &superblock);
+	block_read(0, &superblock);
 
 	// Required error checks. An improper signature exists, or the provided amount of blocks does not correspond to that given by the Block API.
 	if (memcmp(superblock.signature, specified_signature, SIG_LEN) || superblock.tot_amt_blks != block_disk_count()) {
@@ -68,13 +83,18 @@ int fs_mount(const char *diskname)
 	fat = (struct fat_block*)malloc(superblock.num_blks_fat * sizeof(struct fat_block));
 
 	// Read FAT blocks in one by one.
-	int i = SUP_BLK_IDX + 1;
+	int i = 1;
 	while (i <= superblock.num_blks_fat) {
 		block_read(i, &(fat[i - 1]));
 		i++;
 	}
 
 	block_read(i, &root_directory);
+
+	// Denote that initially, no file is associated with any of these unopened file descriptors. Since we use a non-default value (-1) to represent a lack of corresponding filename, this step is essential.
+	for (int j = 0; j < FS_OPEN_MAX_COUNT; j++) {
+		FD[j] = empty_FD;
+	}
 
 	fs_mounted = 1;
 	return 0;
@@ -93,6 +113,11 @@ int fs_umount(void)
 	// We have to reset our root directory entry by entry, due to its implementation's static nature.
 	for (int i = 0; i < FS_FILE_MAX_COUNT; i++) {
 		root_directory[i] = clean_root_dir_entry;
+	}
+
+	// Clean up our file descriptor table.
+	for (int j = 0; j < FS_OPEN_MAX_COUNT; j++) {
+		FD[j] = empty_FD;
 	}
 
 	fs_mounted = 0;
@@ -149,53 +174,253 @@ int fs_info(void)
 	return 0;
 }
 
+static int is_invalid_file(const char* filename) {
+	for (int i = 0; i <= FS_FILENAME_LEN; i++) {
+		if (i == FS_FILENAME_LEN) {
+			return 1;
+		}
+
+		if (filename[i] == '\0') {
+			return 0;
+		}
+	}
+
+	// We should never get here.
+	return -1;
+}
+
 int fs_create(const char *filename)
 {
-	// TODO.
-	(void)filename;
-	return -1;
+	if (!fs_mounted || num_files_root_dir >= FS_FILE_MAX_COUNT || is_invalid_file(filename)) {
+		return -1;
+	}
+
+	// Find the file in the root directory.
+	int x;
+	for (x = 0; x < FS_FILE_MAX_COUNT; x++) {
+		if (!strcmp(filename, root_directory[x].filename)) {
+			break;
+		}
+	}
+
+	// The file already exists.
+	if (x < FS_FILE_MAX_COUNT) {
+		return -1;
+	}
+
+	int entry = 0;
+	while (entry < FS_FILE_MAX_COUNT) {
+		// Find the first empty entry in the root directory.
+		if (root_directory[entry].filename[0] == '\0') {
+			break;
+		}
+
+		entry++;
+	}
+
+	// Fill it in.
+	int i;
+	for (i = 0; i < (int)strlen(filename); i++) {
+		root_directory[entry].filename[i] = filename[i];
+	}
+	root_directory[entry].filename[i] = '\0';
+	root_directory[entry].size_file = 0;
+	root_directory[entry].idx_first_data_blk = FAT_EOC;
+	num_files_root_dir++;
+
+	// Update disk.
+	block_write(superblock.root_dir_blk_idx, &root_directory);
+
+	return 0;
 }
 
 int fs_delete(const char *filename)
 {
-	// TODO.
-	(void)filename;
-	return -1;
+	if (!fs_mounted || is_invalid_file(filename)) {
+		return -1;
+	}
+
+	int x;
+	for (x = 0; x < FS_FILE_MAX_COUNT; x++) {
+		if (!strcmp(filename, root_directory[x].filename)) {
+			break;
+		}
+	}
+
+	// The file does not exist in the file system.
+	if (x >= FS_FILE_MAX_COUNT) {
+		return -1;
+	}
+
+	// The file is currently open.
+	for (int i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		if (FD[i].idx_file_root_dir == x) {
+			return -1;
+		}
+	}
+
+	printf("Pussy!\n");
+	printf("File index: %d\n", x);
+
+	// No need to free space for empty files.
+	if (root_directory[x].idx_first_data_blk != FAT_EOC) {
+		// Find the location in the FAT that corresponds to the beginning of the file.
+		int block = root_directory[x].idx_first_data_blk % NUM_ENTRIES_FAT_BLK;
+		uint16_t byte = root_directory[x].idx_first_data_blk;
+		while (fat[block].next_data_blk[byte] != FAT_EOC) {
+			uint16_t next_location = fat[block].next_data_blk[byte];
+			// Delete each key to the file's contents.
+			fat[block].next_data_blk[byte] = 0;
+			// Find the next FAT block with the file's data.
+			block = next_location % NUM_ENTRIES_FAT_BLK;
+			byte = next_location;
+		}
+		// Free the final bytes.
+		fat[block].next_data_blk[byte] = 0;
+	}
+
+	// Empty the entry in the root directory.
+	root_directory[x].filename[0] = '\0';
+	root_directory[x].size_file = 0;
+	root_directory[x].idx_first_data_blk = FAT_EOC;
+
+	// Write data back to disk.
+	int i = 1;
+	while (i <= superblock.num_blks_fat) {
+		block_write(i, &(fat[i - 1]));
+		i++;
+	}
+	block_write(i, &root_directory);
+
+	return 0;
 }
 
 int fs_ls(void)
 {
-	// TODO.
-	return -1;
+	if (!fs_mounted) {
+		return -1;
+	}
+
+	fprintf(stdout, "FS Ls:\n");
+	for (int i = 0; i < FS_FILE_MAX_COUNT; i++) {
+		if (root_directory[i].filename[0] != '\0') {
+			fprintf(stdout, "file: %s, size: %d, data_blk: %d\n", root_directory[i].filename, root_directory[i].size_file, root_directory[i].idx_first_data_blk);
+		}
+	}
+
+	return 0;
 }
 
 int fs_open(const char *filename)
 {
-	// TODO.
-	(void)filename;
-	return -1;
+	if (!fs_mounted || num_open_fds >= FS_OPEN_MAX_COUNT || is_invalid_file(filename)) {
+		return -1;
+	}
+
+	int i;
+	for (i = 0; i < FS_FILE_MAX_COUNT; i++) {
+		if (!strcmp(filename, root_directory[i].filename)) {
+			break;
+		}
+	}
+
+	// The filename does not appear in the root directory.
+	if (i >= FS_FILE_MAX_COUNT) {
+		return -1;
+	}
+
+	int fd_idx = 0;
+	// This file descriptor is already open.
+	while (FD[fd_idx].file_descriptor != 0) {
+		fd_idx++;
+	}
+
+	FD[fd_idx].file_descriptor = fd_idx + 1;
+	// Redundant, but for readability.
+	FD[fd_idx].file_offset = 0;
+	FD[fd_idx].idx_file_root_dir = i;
+
+	num_open_fds++;
+
+	// We map this quantity to the value of open file_descriptors one-to-one.
+	return num_open_fds;
 }
 
 int fs_close(int fd)
 {
-	// TODO.
-	(void)fd;
-	return -1;
+	if (!fs_mounted || fd > FS_OPEN_MAX_COUNT) {
+		return -1;
+	}
+	
+	int i;
+	for (i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		if (FD[i].file_descriptor == fd) {
+			break;
+		}
+	}
+
+	// This file descriptor is not open.
+	if (i == FS_OPEN_MAX_COUNT) {
+		return -1;
+	}
+
+	// This is how we denote an unopened file descriptor.
+	FD[i].file_descriptor = 0;
+	FD[i].file_offset = 0;
+	FD[i].idx_file_root_dir = -1;
+
+	num_open_fds--;
+
+	return 0;
 }
 
 int fs_stat(int fd)
 {
-	// TODO.
-	(void)fd;
-	return -1;
+	if (!fs_mounted || fd > FS_OPEN_MAX_COUNT) {
+		return -1;
+	}
+	
+	int i;
+	for (i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		if (FD[i].file_descriptor == fd) {
+			break;
+		}
+	}
+
+	// This file descriptor is not open.
+	if (i == FS_OPEN_MAX_COUNT) {
+		return -1;
+	}
+	
+	int j;
+	for (j = 0; j < FS_FILE_MAX_COUNT; j++) {
+		// Find the corresponding file in the root directory. This is guaranteed to exist, as a file descriptor can only be opened for an existing file.
+		if (!strcmp(root_directory[j].filename, root_directory[FD[i].idx_file_root_dir].filename)) {
+			break;
+		}
+	}
+
+	return root_directory[j].size_file;
 }
 
 int fs_lseek(int fd, size_t offset)
 {
-	// TODO.
-	(void)fd;
-	(void)offset;
-	return -1;
+	int size_file = fs_stat(fd);
+	if (size_file == -1 || (int)offset > size_file) {
+		return -1;
+	}
+	
+	int i;
+	for (i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		// Guaranteed to exist, for similar reasons.
+		if (FD[i].file_descriptor == fd) {
+			break;
+		}
+	}
+
+	FD[i].file_offset = offset;
+
+	return 0;
 }
 
 int fs_write(int fd, void *buf, size_t count)

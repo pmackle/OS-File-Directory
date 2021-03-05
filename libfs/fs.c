@@ -10,8 +10,8 @@
 #define FAT_EOC 0xFFFF
 
 #define SIG_LEN 8
-#define SUP_BLK_PAD 4079
 
+// Superblock data structure
 struct __attribute__((__packed__)) superblock {
 	uint8_t signature[SIG_LEN];
 	uint16_t tot_amt_blks;
@@ -19,26 +19,27 @@ struct __attribute__((__packed__)) superblock {
 	uint16_t data_blk_start_idx;
 	uint16_t amt_data_blks;
 	uint8_t num_blks_fat;
-	uint8_t padding[SUP_BLK_PAD];
+	uint8_t padding[4079];
 };
 const uint8_t specified_signature[SIG_LEN] = {'E', 'C', 'S', '1', '5', '0', 'F', 'S'};
 
 #define NUM_ENTRIES_FAT_BLK 2048
 
+// FAT data structure
 struct __attribute__((__packed__)) fat_block {
 	uint16_t next_data_blk[NUM_ENTRIES_FAT_BLK];
 };
 
-#define ROOT_DIR_PAD 10
-
+// Root directory data structure
 struct __attribute__((__packed__)) root_dir_entry {
 	// Explicitly use char array for comparison to final character pointers.
 	char filename[FS_FILENAME_LEN];
 	uint32_t size_file;
 	uint16_t idx_first_data_blk;
-	uint8_t padding[ROOT_DIR_PAD];
+	uint8_t padding[10];
 };
 
+// File descriptor data structure
 struct file_descriptor {
 	int idx_file_root_dir;
 	int file_descriptor;
@@ -66,6 +67,7 @@ static struct file_descriptor FD[FS_OPEN_MAX_COUNT];
 // For tracking purposes.
 static int fs_mounted = 0;
 static int num_files_root_dir = 0;
+static int num_avail_data_blks = 0;
 
 int fs_mount(const char *diskname)
 {
@@ -97,6 +99,8 @@ int fs_mount(const char *diskname)
 	}
 
 	fs_mounted = 1;
+	// First data entry can never be written (always FAT_EOC) in FAT.
+	num_avail_data_blks = superblock.amt_data_blks - 1;
 	return 0;
 }
 
@@ -121,6 +125,7 @@ int fs_umount(void)
 	}
 
 	fs_mounted = 0;
+	num_avail_data_blks = 0;
 	return 0;
 }
 
@@ -259,24 +264,22 @@ int fs_delete(const char *filename)
 		}
 	}
 
-	printf("Pussy!\n");
-	printf("File index: %d\n", x);
-
 	// No need to free space for empty files.
 	if (root_directory[x].idx_first_data_blk != FAT_EOC) {
 		// Find the location in the FAT that corresponds to the beginning of the file.
-		int block = root_directory[x].idx_first_data_blk % NUM_ENTRIES_FAT_BLK;
-		uint16_t byte = root_directory[x].idx_first_data_blk;
-		while (fat[block].next_data_blk[byte] != FAT_EOC) {
-			uint16_t next_location = fat[block].next_data_blk[byte];
+		int block = root_directory[x].idx_first_data_blk / NUM_ENTRIES_FAT_BLK;
+		uint16_t entry = root_directory[x].idx_first_data_blk % NUM_ENTRIES_FAT_BLK;
+		while (fat[block].next_data_blk[entry] != FAT_EOC) {
+			uint16_t next_location = fat[block].next_data_blk[entry];
 			// Delete each key to the file's contents.
-			fat[block].next_data_blk[byte] = 0;
+			fat[block].next_data_blk[entry] = 0;
+			num_avail_data_blks++;
 			// Find the next FAT block with the file's data.
-			block = next_location % NUM_ENTRIES_FAT_BLK;
-			byte = next_location;
+			block = next_location / NUM_ENTRIES_FAT_BLK;
+			entry = next_location % NUM_ENTRIES_FAT_BLK;
 		}
 		// Free the final bytes.
-		fat[block].next_data_blk[byte] = 0;
+		fat[block].next_data_blk[entry] = 0;
 	}
 
 	// Empty the entry in the root directory.
@@ -284,7 +287,7 @@ int fs_delete(const char *filename)
 	root_directory[x].size_file = 0;
 	root_directory[x].idx_first_data_blk = FAT_EOC;
 
-	// Write data back to disk.
+	// Write all potentially modified data back to disk.
 	int i = 1;
 	while (i <= superblock.num_blks_fat) {
 		block_write(i, &(fat[i - 1]));
@@ -324,7 +327,6 @@ int fs_open(const char *filename)
 		}
 	}
 
-	// The filename does not appear in the root directory.
 	if (i >= FS_FILE_MAX_COUNT) {
 		return -1;
 	}
@@ -342,8 +344,7 @@ int fs_open(const char *filename)
 
 	num_open_fds++;
 
-	// We map this quantity to the value of open file_descriptors one-to-one.
-	return num_open_fds;
+	return FD[fd_idx].file_descriptor;
 }
 
 int fs_close(int fd)
@@ -360,7 +361,7 @@ int fs_close(int fd)
 	}
 
 	// This file descriptor is not open.
-	if (i == FS_OPEN_MAX_COUNT) {
+	if (i >= FS_OPEN_MAX_COUNT) {
 		return -1;
 	}
 
@@ -391,16 +392,8 @@ int fs_stat(int fd)
 	if (i == FS_OPEN_MAX_COUNT) {
 		return -1;
 	}
-	
-	int j;
-	for (j = 0; j < FS_FILE_MAX_COUNT; j++) {
-		// Find the corresponding file in the root directory. This is guaranteed to exist, as a file descriptor can only be opened for an existing file.
-		if (!strcmp(root_directory[j].filename, root_directory[FD[i].idx_file_root_dir].filename)) {
-			break;
-		}
-	}
 
-	return root_directory[j].size_file;
+	return root_directory[FD[i].idx_file_root_dir].size_file;
 }
 
 int fs_lseek(int fd, size_t offset)
@@ -425,18 +418,214 @@ int fs_lseek(int fd, size_t offset)
 
 int fs_write(int fd, void *buf, size_t count)
 {
-	// TODO.
-	(void)fd;
-	(void)buf;
-	(void)count;
-	return -1;
+	// Error checking. 
+	if (!fs_mounted || fd > FS_OPEN_MAX_COUNT || buf == NULL){
+		return -1;
+	}
+
+	int i;
+	for (i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		if (FD[i].file_descriptor == fd) {
+			break;
+		}
+	}
+
+	// This file descriptor is not open.
+	if (i == FS_OPEN_MAX_COUNT) {
+		return -1;
+	}
+
+	int x = FD[i].idx_file_root_dir;
+	int j = root_directory[x].idx_first_data_blk;
+
+	uint16_t file_blocks[superblock.amt_data_blks];
+
+	for (int k = 0; k < superblock.amt_data_blks; k++) {
+		file_blocks[k] = FAT_EOC;
+	}
+	// If first_data_blk is not empty
+	int counter = 0;
+	if (j != FAT_EOC) {
+		file_blocks[0] = superblock.data_blk_start_idx + j;
+	
+		int block = j / NUM_ENTRIES_FAT_BLK;
+		uint16_t entry = j % NUM_ENTRIES_FAT_BLK;
+
+		counter++;
+		while (fat[block].next_data_blk[entry] != FAT_EOC) {
+			uint16_t next_location = fat[block].next_data_blk[entry];
+			// Delete each key to the file's contents.
+			file_blocks[counter] = superblock.data_blk_start_idx + next_location;
+			// Find the next FAT block with the file's data.
+			block = next_location / NUM_ENTRIES_FAT_BLK;
+			entry = next_location % NUM_ENTRIES_FAT_BLK;
+			counter++;
+		}
+	}
+	uint8_t* file_blocks_array = counter == 0 ? NULL : (uint8_t*)malloc(counter * BLOCK_SIZE * sizeof(uint8_t));
+	int t = 0;
+	while (file_blocks[t] != FAT_EOC) {
+		block_read(file_blocks[t], &file_blocks_array[t*BLOCK_SIZE]);
+		t++;
+	}
+
+	int offset = FD[i].file_offset;
+	size_t actual_count = count;
+	if (count > root_directory[x].size_file - offset) {
+		actual_count = root_directory[x].size_file - offset;
+	}
+	memcpy(&file_blocks_array[offset], buf, actual_count);
+
+	int z = actual_count;
+
+	// While there are still more characters to write.
+	while (z < (int)count) {
+		// While there is still space in the block.
+		while (counter != 0 && ((z + offset) / (counter * BLOCK_SIZE) == 0)) {
+			// There is nothing left to write with a block that still has space.
+			if (z == (int)count){
+				break;
+			}
+			memcpy(&file_blocks_array[z + offset], buf + z, 1);
+			z++;
+			(root_directory[x].size_file)++;
+		}
+
+		// While there is still more to write, but
+		// we are at the end of the block.
+		if (z < (int)count) {
+			// If no more data blocks to spare, stop writing.
+			if (num_avail_data_blks == 0) {
+				break;
+			}
+
+			// Else, allocate another data block and keep going.
+			else {
+				uint16_t v = root_directory[x].idx_first_data_blk;
+
+				// Must update idx_first_data_blk if empty file being written to.
+
+				int block = v / NUM_ENTRIES_FAT_BLK;
+				uint16_t entry = v % NUM_ENTRIES_FAT_BLK;
+				// This loop finds the last block of the current file (0xFFFF).
+				if (v != FAT_EOC) {
+					while (fat[block].next_data_blk[entry] != FAT_EOC) {
+						uint16_t next_location = fat[block].next_data_blk[entry];
+						block = next_location / NUM_ENTRIES_FAT_BLK;
+						entry = next_location % NUM_ENTRIES_FAT_BLK;
+					}
+				}	
+				for (int c = 0; c < superblock.num_blks_fat; c++) {
+					for (int d = 0; d < NUM_ENTRIES_FAT_BLK; d++) {
+						if (fat[c].next_data_blk[d] == 0) {
+							if (v != FAT_EOC) {
+								fat[block].next_data_blk[entry] = c * NUM_ENTRIES_FAT_BLK + d;
+							}
+							// This is the new last block that contains the curent block.
+							fat[c].next_data_blk[d] = FAT_EOC;
+							file_blocks[counter] = (c * NUM_ENTRIES_FAT_BLK + d) + superblock.data_blk_start_idx;
+
+							if (v == FAT_EOC) {
+								root_directory[x].idx_first_data_blk = c * NUM_ENTRIES_FAT_BLK + d; 
+							}
+							// Increases the file_blocks array so we can add another block to it.
+							file_blocks_array = (uint8_t*)realloc(file_blocks_array, (counter + 1) * BLOCK_SIZE * sizeof(uint8_t));
+
+							block_read(file_blocks[counter], &file_blocks_array[counter * BLOCK_SIZE]);
+
+							counter++;
+							num_avail_data_blks--;
+							break;
+						}
+					}
+					break;
+				}
+			}
+			
+		}
+	}
+
+	int l = 0;
+	while (file_blocks[l] != FAT_EOC) {
+		block_write(file_blocks[l], &file_blocks_array[l * BLOCK_SIZE]);
+		l++;
+	}
+
+	free(file_blocks_array);
+
+	block_write(superblock.root_dir_blk_idx, &root_directory);
+
+	int y = 1;
+	while (y <= superblock.num_blks_fat) {
+		block_write(y, &(fat[y - 1]));
+		y++;
+	}
+
+	return z;
 }
 
 int fs_read(int fd, void *buf, size_t count)
 {
-	// TODO.
-	(void)fd;
-	(void)buf;
-	(void)count;
-	return -1;
+	if (!fs_mounted || fd > FS_OPEN_MAX_COUNT || buf == NULL){
+		return -1;
+	}
+
+	int i;
+	for (i = 0; i < FS_OPEN_MAX_COUNT; i++) {
+		if (FD[i].file_descriptor == fd) {
+			break;
+		}
+	}
+
+	// This file descriptor is not open.
+	if (i == FS_OPEN_MAX_COUNT) {
+		return -1;
+	}
+
+	int x = FD[i].idx_file_root_dir;
+	int j = root_directory[x].idx_first_data_blk;
+
+	uint16_t file_blocks[superblock.amt_data_blks];
+
+	for (int k = 0; k < superblock.amt_data_blks; k++) {
+		file_blocks[k] = FAT_EOC;
+	}
+
+	// If first_data_blk is not empty
+	int counter = 0;
+	if (j != FAT_EOC) {
+		file_blocks[counter] = superblock.data_blk_start_idx + j;
+	
+		int block = j / NUM_ENTRIES_FAT_BLK;
+		uint16_t entry = j % NUM_ENTRIES_FAT_BLK;
+		counter++;
+		while (fat[block].next_data_blk[entry] != FAT_EOC) {
+			uint16_t next_location = fat[block].next_data_blk[entry];
+			// Delete each key to the file's contents.
+			file_blocks[counter] = superblock.data_blk_start_idx + next_location;
+			// Find the next FAT block with the file's data.
+			block = next_location / NUM_ENTRIES_FAT_BLK;
+			entry = next_location % NUM_ENTRIES_FAT_BLK;
+			counter++;
+		}
+	} else {
+		return 0;
+	}
+
+	uint8_t file_blocks_array[counter * BLOCK_SIZE];
+	int k = 0;
+	while (file_blocks[k] != FAT_EOC) {
+		block_read(file_blocks[k], &file_blocks_array[k*BLOCK_SIZE]);
+		k++;
+	}
+
+	size_t actual_count = count;
+	if (count > root_directory[x].size_file - FD[i].file_offset) {
+		actual_count = root_directory[x].size_file - FD[i].file_offset;
+	}
+	
+	memcpy(buf, &file_blocks_array[FD[i].file_offset], actual_count);
+
+	FD[i].file_offset += actual_count;
+	return actual_count;
 }
